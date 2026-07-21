@@ -3,5 +3,5 @@ resource "random_id" "suffix" {
 }
 
 resource "aws_s3_bucket" "demo" {
-           bucket = "morgan-cicd-demo-${random_id.suffix.hex}"
+  bucket = "morgan-cicd-demo-${random_id.suffix.hex}"
 }
