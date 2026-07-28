@@ -1,95 +1,119 @@
 # Terraform CI/CD Pipeline with GitHub Actions
 
-A production-pattern CI/CD pipeline for Terraform: plan on pull request, apply on merge, with linting and security scanning gating every change — and no long-lived AWS credentials anywhere.
+An automated pipeline for deploying AWS infrastructure. Open a pull request and it shows you exactly what would change. Merge it and the change goes live. No AWS keys stored anywhere.
 
-## What it does
+## What happens when
 
-| Trigger | What runs |
+| When | What runs |
 |---|---|
-| Pull request to `main` | `fmt` → `validate` → `tflint` → `checkov` → `plan` (posted as a PR comment) |
-| Merge to `main` | `terraform apply` |
+| You open a pull request | Format check, validation, linting, security scan, and a `terraform plan` posted as a comment |
+| You merge to `main` | `terraform apply`, so the change goes live in AWS |
 
-Branch protection means changes cannot reach `main` any other way — no direct pushes, no merging with failing checks.
+You can't skip these. Branch protection blocks pushing straight to `main`, and a pull request won't merge until the checks pass.
 
-## Architecture
+## How it fits together
 
 ```
-Pull request opened
+Open a pull request
    │
-   ├─ terraform fmt / validate        (syntax + formatting)
-   ├─ tflint                          (Terraform best practices)
-   ├─ checkov                         (security misconfiguration scan — blocks merge on failure)
-   └─ terraform plan                  → posted as PR comment for review
+   ├─ terraform fmt / validate    Is the code formatted and syntactically valid?
+   ├─ tflint                      Does it follow Terraform best practices?
+   ├─ checkov                     Any security misconfigurations? (blocks the merge)
+   └─ terraform plan              What would change? Posted as a PR comment.
    │
 Merge to main
    │
-   └─ terraform apply                 → live AWS infrastructure
+   └─ terraform apply             The change is made in AWS
 
-Authentication throughout: GitHub OIDC → AWS IAM role (no stored credentials)
+Throughout: GitHub proves its identity to AWS using OIDC, so no credentials are stored
 ```
 
-## Authentication: OIDC, not access keys
+## Why OIDC instead of access keys
 
-The pipeline authenticates to AWS using GitHub's OIDC provider rather than storing an access key and secret in GitHub Secrets. Each workflow run receives a short-lived token, signed by GitHub, that AWS validates against a trust policy pinned to this specific repository.
+The usual approach is to create an AWS access key and store it in GitHub Secrets. That key is long-lived. If it leaks, whoever has it keeps access until you notice and rotate it.
 
-No long-lived credentials exist to leak or rotate.
+This pipeline uses OIDC. Every workflow run gets a fresh token signed by GitHub, valid for a few minutes. AWS checks the token against a trust policy that's pinned to this specific repository, then hands back temporary credentials that expire on their own. There's no stored key to leak in the first place.
 
-## Least privilege
+## What the pipeline is allowed to do
 
-The IAM role is scoped to only what the pipeline owns:
+The IAM role it assumes is deliberately narrow:
 
-- **Terraform state bucket** — read/write on the state bucket only
-- **State lock table** — `GetItem`/`PutItem`/`DeleteItem` on the DynamoDB lock table only
-- **Demo resources** — full S3 actions, but scoped by resource ARN to `morgan-cicd-demo-*`
+- Terraform state bucket: read and write, that bucket only
+- State lock table: read, write and delete items, that table only
+- Demo resources: full S3 permissions, but only on buckets named `morgan-cicd-demo-*`
 
-The role has no access to anything else in the account.
+It can't touch anything else in the account. If the pipeline were ever compromised, that's the limit of the damage.
 
 ## Security scanning
 
-Checkov runs on every PR with `soft_fail: false` — findings block the merge.
+Checkov scans every pull request and blocks the merge if it finds a problem.
 
-Four checks are explicitly skipped, each with a documented reason inline in `main.tf`:
+Four of its checks are switched off. The reason for each is written into `main.tf` next to the code:
 
-| Check | Reason for skip |
+| Check | Why it's skipped |
 |---|---|
-| `CKV_AWS_18` (access logging) | Requires a second bucket; out of scope for a demo |
-| `CKV_AWS_144` (cross-region replication) | Unnecessary and costly for a sandbox |
-| `CKV2_AWS_61` (lifecycle config) | Bucket holds no objects |
-| `CKV2_AWS_62` (event notifications) | Requires an SNS/SQS/Lambda target not present |
+| `CKV_AWS_18` (access logging) | Would need a second bucket just to hold the logs |
+| `CKV_AWS_144` (cross-region replication) | Costs money and does nothing useful for a demo |
+| `CKV2_AWS_61` (lifecycle rules) | The bucket doesn't store anything |
+| `CKV2_AWS_62` (event notifications) | Needs an SNS or Lambda target that doesn't exist here |
 
-Suppressing findings without a stated reason is how scanners become noise. Each skip here is a recorded decision, visible in code review.
+Switching off checks without recording why is how a scanner turns into background noise that everyone ignores. Each of these is a decision someone can read and argue with.
 
-## Tech used
+## Built with
 
-- **AWS** — S3 (state + demo bucket), DynamoDB (state locking), IAM, OIDC identity provider
-- **Terraform** — v1.x, AWS provider v5, S3 remote backend
-- **GitHub Actions** — OIDC auth, PR/push-triggered jobs, PR commenting via `github-script`
-- **tflint** — Terraform linting
-- **checkov** — security and misconfiguration scanning
+- AWS: S3, DynamoDB, IAM, OIDC identity provider
+- Terraform v1.x, AWS provider v5, S3 remote backend
+- GitHub Actions, with OIDC authentication and PR comments via `github-script`
+- tflint for linting
+- checkov for security scanning
 
-## Repository layout
+## Files
 
 ```
 .
 ├── .github/workflows/terraform.yml   # the pipeline
-├── main.tf                           # demo resources (S3 bucket + hardening)
-├── versions.tf                       # provider versions + S3 backend config
+├── main.tf                           # the S3 bucket and its security settings
+├── versions.tf                       # provider versions and where state is stored
 └── README.md
 ```
 
-## Setting this up yourself
+## Running this yourself
 
-1. Create an S3 bucket for Terraform state and a DynamoDB table for state locking
-2. Create an IAM OIDC identity provider for `token.actions.githubusercontent.com`, audience `sts.amazonaws.com`
-3. Create an IAM role with a trust policy pinned to your repository, and a permissions policy scoped to your state bucket, lock table, and target resources
-4. Add the role ARN as a repository variable named `AWS_ROLE_ARN`
-5. Update the backend block in `versions.tf` with your bucket and table names
-6. Enable branch protection on `main`: require a PR, and require the `checks` status check to pass
+1. Create an S3 bucket for Terraform state and a DynamoDB table for locking.
+2. In IAM, add an OIDC identity provider for `token.actions.githubusercontent.com` with audience `sts.amazonaws.com`.
+3. Create an IAM role that trusts that provider, restricted to your repository, with permissions covering your state bucket, lock table and whatever you're deploying.
+4. Add the role's ARN as a repository variable called `AWS_ROLE_ARN`.
+5. Point the backend block in `versions.tf` at your bucket and table.
+6. Turn on branch protection for `main`. Require a pull request, and require the `checks` job to pass.
 
-## What I learned
+## Problems I hit and how I solved them
 
-**GitHub's immutable OIDC subject claims.** The pipeline failed with `Not authorized to perform sts:AssumeRoleWithWebIdentity` despite a trust policy that looked correct. Rather than guessing, I added a temporary step to decode the actual OIDC token in the workflow log — which revealed GitHub now issues a subject claim in the format `repo:owner@ownerID/repo@repoID:event` for repositories created after 15 July 2026, embedding numeric IDs instead of names. Updating the trust policy to pin those IDs fixed it, and is more secure than name-based matching: a recycled username or repository name can't be used to impersonate the original.
+### The pipeline couldn't authenticate and the trust policy looked correct
 
-**Least privilege is iterative, not up-front.** The first `apply` failed on `s3:CreateBucket`. Adding that surfaced a failure on `s3:GetBucketPolicy`, then `s3:GetAccelerateConfiguration` — the AWS provider reads back a large number of bucket sub-configurations on every apply, whether or not the Terraform code sets them. Rather than enumerating them indefinitely, I scoped the policy by *resource* instead of by action: full S3 permissions, but only on ARNs matching `morgan-cicd-demo-*`. The blast radius is what matters, not the action count.
+Every run failed with `Not authorized to perform sts:AssumeRoleWithWebIdentity`. I checked the trust policy, the OIDC provider, the audience, the role ARN and the username casing. All fine.
 
-**Security scanning has to be able to say no.** Checkov initially ran with `soft_fail: true`, which reports findings without failing the build. That was useful for establishing a baseline, but a scanner that can't block a merge isn't a control. Once the real findings were fixed and the out-of-scope ones documented, I switched it to fail the build.
+Rather than keep guessing, I added a temporary step that decoded the token GitHub was actually sending and printed it into the workflow log. The subject claim came back as:
+
+```
+repo:mifidon96@86232639/terraform-cicd-demo@1307772990:pull_request
+```
+
+The trust policy was expecting `repo:owner/repo:event`. GitHub changed this format in July 2026 for newly created repositories, so the subject now carries numeric account and repository IDs alongside the names. Updating the trust policy to match fixed it straight away.
+
+The new format is also harder to abuse. Usernames and repository names can be given up and claimed by someone else. The numeric IDs can't.
+
+### Every apply hit a different permissions error
+
+The first apply failed on `s3:CreateBucket`, so I added it. The next failed on `s3:GetBucketPolicy`. Added that too. The one after failed on `s3:GetAccelerateConfiguration`.
+
+The AWS provider reads back roughly fifteen separate bucket settings on every run, regardless of whether the Terraform code configures them. Adding permissions one error at a time was never going to converge.
+
+I changed approach and granted all S3 actions, but restricted by resource to bucket names matching `morgan-cicd-demo-*`. The role can do whatever it likes to the buckets this pipeline creates and nothing at all to any other bucket in the account.
+
+The useful measure for least privilege turned out to be how much damage a compromised role could do, rather than how short the list of allowed actions is.
+
+### A security scanner that can't block anything doesn't achieve much
+
+I started checkov in `soft_fail` mode, which reports problems but lets the build pass anyway. That was the right call initially. It surfaced all seven findings without blocking me while I worked out what to do about them.
+
+Left like that, though, it's a warning nobody reads. Once I'd fixed the three real issues and documented why the other four didn't apply, I turned `soft_fail` off. A new misconfiguration now stops the merge.
