@@ -42,7 +42,7 @@ jobs:
         with:
           directory: .
           quiet: true
-          soft_fail: true
+          soft_fail: false
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
